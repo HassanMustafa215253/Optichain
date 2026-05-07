@@ -1,0 +1,39 @@
+branch_employee|salary|double precision
+branch_import_cost|from_branch_id|integer
+branch_import_cost|to_branch_id|integer
+branch_import_cost|cost|real
+catogary|name|text
+central_inventory|price|double precision
+city|country_name|text
+city|city|text
+country|name|text
+customer|branch_id|integer
+customer|name|text
+customer_b2|branch_id|integer
+customer_b2|name|text
+inventory|branch_id|integer
+inventory_b2|branch_id|integer
+local_item|branch_id|integer
+local_item|name|text
+local_item|catogary_name|text
+local_item_b2|branch_id|integer
+local_item_b2|name|text
+local_item_b2|catogary_name|text
+order_detail|branch_id|integer
+order_detail_b2|branch_id|integer
+orders|branch_id|integer
+orders|order_date|date
+orders|final_date|date
+orders|cost|double precision
+orders|status|text
+orders|payment_done|double precision
+orders_b2|branch_id|integer
+orders_b2|order_date|date
+orders_b2|final_date|date
+orders_b2|cost|double precision
+orders_b2|status|text
+orders_b2|payment_done|double precision
+requisition_list|branch_id|integer
+requisition_list|sales_order_quantity|real
+requisition_list_b2|branch_id|integer
+requisition_list_b2|sales_order_quantity|real
