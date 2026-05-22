@@ -294,7 +294,7 @@ function Inventory() {
     return (
         <div className="h-screen px-4 py-2 flex items-center justify-center">
 
-            <div className="w-full max-w-[1200px] h-[calc(100vh-28px)] mb-3 mx-auto flex flex-col rounded-2xl overflow-hidden shadow-[0_12px_25px_rgba(0,0,0,0.07)] bg-white">
+            <div className="w-full max-w-[1200px] max-h-[calc(100vh-28px)] mb-3 mx-auto flex flex-col rounded-2xl overflow-hidden shadow-[0_12px_25px_rgba(0,0,0,0.07)] bg-white">
 
                 {/* Header */}
                 <div className="flex items-end justify-between px-8 pt-4 pb-3 border-b border-gray-200">
@@ -342,7 +342,7 @@ function Inventory() {
                 </div>
 
                 {/* Body */}
-                <div className="flex-1 m-2 p-4 overflow-hidden flex flex-col">
+                <div className="flex-1 min-h-0 m-2 p-4 overflow-hidden flex flex-col">
 
                     {error && (
                         <div className="text-red-500 mb-4">

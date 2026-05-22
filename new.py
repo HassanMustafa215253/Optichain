@@ -9,13 +9,43 @@ from sqlalchemy.ext.automap import automap_base
 from jose import jwt
 from jose.exceptions import JWTError
 from datetime import datetime, timedelta
+import json
 import logging
+import os
 
 import schema
+
+try:
+    import redis
+    from redis.exceptions import RedisError
+except ImportError:
+    redis = None
+    RedisError = Exception
 
 SECRET_KEY = "sdkljn$jern@r3jrn34kjb..34orn&un5479*hn34iugskd!fnvs()334jnk3"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_ENABLED = os.getenv("REDIS_ENABLED", "true").lower() in {"1", "true", "yes"}
+REDIS_TTL_SECONDS = int(os.getenv("REDIS_TTL_SECONDS", "60"))
+CACHE_PREFIX = "cache:v1"
+_redis_client = None
+
+
+def parse_optional_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+ROLE_MANAGER_ID = parse_optional_int(os.getenv("ROLE_MANAGER_ID"))
+ROLE_ADMIN_ID = parse_optional_int(os.getenv("ROLE_ADMIN_ID"))
+ROLE_FINANCE_ID = parse_optional_int(os.getenv("ROLE_FINANCE_ID"))
+ROLE_WORKER_ID = parse_optional_int(os.getenv("ROLE_WORKER_ID"))
 
 # -----------------------------
 # DATABASE SETUP
@@ -151,6 +181,95 @@ def resolve_local_item_id(
     return rows[0][0]
 
 
+def get_redis_client():
+    global _redis_client
+    if not REDIS_ENABLED or redis is None:
+        return None
+
+    if _redis_client is None:
+        try:
+            _redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+            _redis_client.ping()
+        except RedisError as exc:
+            logging.warning("Redis unavailable: %s", exc)
+            _redis_client = None
+
+    return _redis_client
+
+
+def cache_json_dumps(value):
+    return json.dumps(value, default=str)
+
+
+def cache_get_json(key: str):
+    client = get_redis_client()
+    if client is None:
+        return None
+
+    try:
+        cached = client.get(key)
+        if cached is None:
+            return None
+        return json.loads(cached)
+    except (RedisError, json.JSONDecodeError) as exc:
+        logging.warning("Redis read failed for %s: %s", key, exc)
+        return None
+
+
+def cache_set_json(key: str, value, ttl_seconds: int = REDIS_TTL_SECONDS):
+    client = get_redis_client()
+    if client is None:
+        return
+
+    try:
+        client.set(key, cache_json_dumps(value), ex=ttl_seconds)
+    except RedisError as exc:
+        logging.warning("Redis write failed for %s: %s", key, exc)
+
+
+def cache_delete(key: str):
+    client = get_redis_client()
+    if client is None:
+        return
+
+    try:
+        client.delete(key)
+    except RedisError as exc:
+        logging.warning("Redis delete failed for %s: %s", key, exc)
+
+
+def admin_cache_key(branch_id: int, resource: str) -> str:
+    return f"{CACHE_PREFIX}:admin:{branch_id}:{resource}"
+
+
+def get_table_class(table_name: str):
+    return getattr(Base.classes, table_name, None)
+
+
+def require_table_class(table_name: str):
+    table_class = get_table_class(table_name)
+    if table_class is None:
+        raise HTTPException(status_code=500, detail=f"Missing table: {table_name}")
+    return table_class
+
+
+def get_column(table_class, *names):
+    for name in names:
+        if hasattr(table_class, name):
+            return getattr(table_class, name)
+    return None
+
+
+def require_column(table_class, *names):
+    column = get_column(table_class, *names)
+    if column is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing column {names} on {table_class.__name__}",
+        )
+    return column
+
+
 # -----------------------------
 # Main - Login
 # -----------------------------
@@ -223,8 +342,14 @@ def get_requisition_list(db: Session = Depends(get_db_with_role), user=Depends(g
         .where(Req.branch_id == user["branch_id"])
     )
 
+    cache_key = admin_cache_key(user["branch_id"], "requisitions")
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        rows = db.execute(stmt).mappings().all()
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        cache_set_json(cache_key, rows)
         return rows
     except SQLAlchemyError as e:
         logging.error("DB error: %s", e)
@@ -261,6 +386,7 @@ def update_requisition(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Requisition not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "requisitions"))
         return {"message": "Requisition updated"}
     except HTTPException:
         db.rollback()
@@ -294,6 +420,7 @@ def delete_requisition(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Requisition not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "requisitions"))
         return {"message": "Requisition deleted"}
     except HTTPException:
         db.rollback()
@@ -329,8 +456,14 @@ def get_all_orders(db: Session = Depends(get_db_with_role), user=Depends(get_cur
         .where(Orders.branch_id == user["branch_id"])
     )   
 
+    cache_key = admin_cache_key(user["branch_id"], "orders")
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        rows = db.execute(stmt).mappings().all()
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        cache_set_json(cache_key, rows)
         return rows
     except SQLAlchemyError as e:
         logging.error("DB error: %s", e)
@@ -372,6 +505,7 @@ def update_order(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Order not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "orders"))
         return {"message": "Order updated"}
     except HTTPException:
         db.rollback()
@@ -405,6 +539,7 @@ def delete_order(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Order not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "orders"))
         return {"message": "Order deleted"}
     except HTTPException:
         db.rollback()
@@ -432,8 +567,14 @@ def get_customers(db: Session = Depends(get_db_with_role), user=Depends(get_curr
         .order_by(Customer.customer_id)
     )
 
+    cache_key = admin_cache_key(user["branch_id"], "customers")
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        rows = db.execute(stmt).mappings().all()
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        cache_set_json(cache_key, rows)
         return rows
     except SQLAlchemyError as e:
         logging.error("DB error: %s", e)
@@ -460,6 +601,7 @@ def create_customer(
         db.add(new_customer)
         db.commit()
 
+        cache_delete(admin_cache_key(user["branch_id"], "customers"))
         return {"message": "Customer created successfully"}
     except SQLAlchemyError as e:
         db.rollback()
@@ -500,6 +642,7 @@ def update_customer(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Customer not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "customers"))
         return {"message": "Customer updated"}
     except HTTPException:
         db.rollback()
@@ -533,6 +676,7 @@ def delete_customer(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Customer not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "customers"))
         return {"message": "Customer deleted"}
     except HTTPException:
         db.rollback()
@@ -561,8 +705,14 @@ def get_inventory(db: Session = Depends(get_db_with_role), user=Depends(get_curr
         .where(Inventory.branch_id == user["branch_id"])
     )   
 
+    cache_key = admin_cache_key(user["branch_id"], "inventory")
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        rows = db.execute(stmt).mappings().all()
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        cache_set_json(cache_key, rows)
         return rows
     except SQLAlchemyError as e:
         logging.error("DB error: %s", e)
@@ -588,8 +738,14 @@ def get_local_items(
         LocalItem.production_cost
     ).where(LocalItem.branch_id == user["branch_id"])
 
+    cache_key = admin_cache_key(user["branch_id"], "local_items")
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        rows = db.execute(stmt).mappings().all()
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        cache_set_json(cache_key, rows)
         return rows
 
     except SQLAlchemyError as e:
@@ -635,6 +791,7 @@ def create_inventory_item(
         if existing_inventory:
             existing_inventory.quantity = existing_inventory.quantity + item.quantity
             db.commit()
+            cache_delete(admin_cache_key(user["branch_id"], "inventory"))
             return {"message": "Inventory quantity updated"}
 
         new_inventory = Inventory(
@@ -645,6 +802,7 @@ def create_inventory_item(
 
         db.add(new_inventory)
         db.commit()
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
         return {"message": "Inventory item created successfully"}
 
     except HTTPException:
@@ -679,6 +837,8 @@ def create_local_item(
         db.add(new_item)
         db.commit()
 
+        cache_delete(admin_cache_key(user["branch_id"], "local_items"))
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
         return {"message": "Item created successfully"}
 
     except SQLAlchemyError as e:
@@ -719,6 +879,8 @@ def update_local_item(
         if result.rowcount == 0: #type: ignore
             raise HTTPException(status_code=404, detail="Item not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "local_items"))
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
         return {"message": "Item updated"}
 
     except SQLAlchemyError as e:
@@ -750,6 +912,8 @@ def delete_local_item(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Item not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "local_items"))
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
         return {"message": "Item deleted"}
     except HTTPException:
         db.rollback()
@@ -806,6 +970,7 @@ def update_inventory_item(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Inventory item not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
         return {"message": "Inventory item updated"}
     except HTTPException:
         db.rollback()
@@ -839,12 +1004,617 @@ def delete_inventory_item(
         if result.rowcount == 0:  # type: ignore
             raise HTTPException(status_code=404, detail="Inventory item not found")
 
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
         return {"message": "Inventory item deleted"}
     except HTTPException:
         db.rollback()
         raise
     except SQLAlchemyError as e:
         db.rollback()
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+# -----------------------------
+# Central Admin
+# -----------------------------
+
+@Central_Admin_Router.get("/branches")
+def get_branch_summary(db: Session = Depends(get_db_with_role)):
+    BranchTracker = get_table_class("branch_tracker")
+    Orders = get_table_class("orders")
+
+    if BranchTracker is None and Orders is None:
+        raise HTTPException(status_code=500, detail="No branch data sources available")
+
+    if BranchTracker is not None:
+        branch_id = require_column(BranchTracker, "branch_id")
+        report_date = require_column(BranchTracker, "report_date")
+        sales = require_column(BranchTracker, "sales")
+        production_cost = require_column(BranchTracker, "production_cost")
+        operation_cost = require_column(BranchTracker, "operation_cost")
+
+        stmt = (
+            select(
+                branch_id.label("branch_id"),
+                func.max(report_date).label("latest_report_date"),
+                func.coalesce(func.sum(sales), 0).label("total_sales"),
+                func.coalesce(func.sum(production_cost), 0).label("total_production_cost"),
+                func.coalesce(func.sum(operation_cost), 0).label("total_operation_cost"),
+            )
+            .group_by(branch_id)
+            .order_by(branch_id)
+        )
+    else:
+        branch_id = require_column(Orders, "branch_id")
+        price = get_column(Orders, "price")
+        cost = get_column(Orders, "cost")
+
+        columns = [
+            branch_id.label("branch_id"),
+            func.count().label("order_count"),
+        ]
+
+        if price is not None:
+            columns.append(func.coalesce(func.sum(price), 0).label("total_sales"))
+        if cost is not None:
+            columns.append(func.coalesce(func.sum(cost), 0).label("total_cost"))
+
+        stmt = select(*columns).group_by(branch_id).order_by(branch_id)
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Central_Admin_Router.get("/managers")
+def get_managers(
+    role_id: int | None = None,
+    db: Session = Depends(get_db_with_role),
+):
+    BranchEmployee = require_table_class("branch_employee")
+    Employee = get_table_class("employee")
+
+    employee_id = require_column(BranchEmployee, "employee_id")
+    branch_id = require_column(BranchEmployee, "branch_id")
+    role_col = get_column(BranchEmployee, "employee_role")
+    salary_col = get_column(BranchEmployee, "salary")
+
+    columns = [
+        employee_id.label("employee_id"),
+        branch_id.label("branch_id"),
+    ]
+
+    if role_col is not None:
+        columns.append(role_col.label("role_id"))
+    if salary_col is not None:
+        columns.append(salary_col.label("salary"))
+
+    employee_join = False
+    if Employee is not None:
+        emp_id = get_column(Employee, "employee_id")
+        if emp_id is not None:
+            employee_join = True
+            name_col = get_column(Employee, "name", "full_name")
+            email_col = get_column(Employee, "email")
+            phone_col = get_column(Employee, "phone", "phone_number")
+
+            if name_col is not None:
+                columns.append(name_col.label("employee_name"))
+            if email_col is not None:
+                columns.append(email_col.label("employee_email"))
+            if phone_col is not None:
+                columns.append(phone_col.label("employee_phone"))
+
+    stmt = select(*columns).select_from(BranchEmployee)
+    if employee_join:
+        stmt = stmt.outerjoin(Employee, get_column(Employee, "employee_id") == employee_id)
+
+    if role_id is None and ROLE_MANAGER_ID is not None:
+        role_id = ROLE_MANAGER_ID
+
+    if role_id is not None:
+        if role_col is None:
+            raise HTTPException(status_code=500, detail="Role column not found")
+        stmt = stmt.where(role_col == role_id)
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Central_Admin_Router.get("/reports")
+def get_financial_reports(db: Session = Depends(get_db_with_role)):
+    BranchTracker = require_table_class("branch_tracker")
+
+    branch_id = require_column(BranchTracker, "branch_id")
+    report_date = require_column(BranchTracker, "report_date")
+    sales = require_column(BranchTracker, "sales")
+    production_cost = require_column(BranchTracker, "production_cost")
+    operation_cost = require_column(BranchTracker, "operation_cost")
+
+    stmt = (
+        select(
+            branch_id.label("branch_id"),
+            report_date.label("report_date"),
+            sales.label("sales"),
+            production_cost.label("production_cost"),
+            operation_cost.label("operation_cost"),
+        )
+        .order_by(report_date.desc())
+    )
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+# -----------------------------
+# Manager
+# -----------------------------
+
+@Manager_Router.get("/team")
+def get_branch_team(
+    role_id: int | None = None,
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    BranchEmployee = require_table_class("branch_employee")
+    Employee = get_table_class("employee")
+    RoleTable = get_table_class("employee_role")
+
+    employee_id = require_column(BranchEmployee, "employee_id")
+    branch_id = require_column(BranchEmployee, "branch_id")
+    role_col = get_column(BranchEmployee, "employee_role")
+    salary_col = get_column(BranchEmployee, "salary")
+
+    columns = [
+        employee_id.label("employee_id"),
+        branch_id.label("branch_id"),
+    ]
+
+    if role_col is not None:
+        columns.append(role_col.label("role_id"))
+    if salary_col is not None:
+        columns.append(salary_col.label("salary"))
+
+    employee_join = False
+    if Employee is not None:
+        emp_id = get_column(Employee, "employee_id")
+        if emp_id is not None:
+            employee_join = True
+            name_col = get_column(Employee, "name", "full_name")
+            email_col = get_column(Employee, "email")
+            phone_col = get_column(Employee, "phone", "phone_number")
+
+            if name_col is not None:
+                columns.append(name_col.label("employee_name"))
+            if email_col is not None:
+                columns.append(email_col.label("employee_email"))
+            if phone_col is not None:
+                columns.append(phone_col.label("employee_phone"))
+
+    role_join = False
+    if RoleTable is not None and role_col is not None:
+        role_id_col = get_column(RoleTable, "role_id", "id")
+        role_name_col = get_column(RoleTable, "role_name", "name")
+        if role_id_col is not None and role_name_col is not None:
+            role_join = True
+            columns.append(role_name_col.label("role_name"))
+
+    stmt = select(*columns).select_from(BranchEmployee)
+
+    if employee_join:
+        stmt = stmt.outerjoin(Employee, get_column(Employee, "employee_id") == employee_id)
+    if role_join:
+        stmt = stmt.outerjoin(RoleTable, get_column(RoleTable, "role_id", "id") == role_col)
+
+    stmt = stmt.where(branch_id == user["branch_id"])
+
+    if role_id is not None:
+        if role_col is None:
+            raise HTTPException(status_code=500, detail="Role column not found")
+        stmt = stmt.where(role_col == role_id)
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Manager_Router.get("/orders")
+def get_manager_orders(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    Orders = require_table_class("orders")
+    Customer = get_table_class("customer")
+
+    order_id = require_column(Orders, "order_id")
+    branch_id = require_column(Orders, "branch_id")
+    status_col = get_column(Orders, "status")
+    price_col = get_column(Orders, "price")
+    cost_col = get_column(Orders, "cost")
+    order_date = get_column(Orders, "order_date")
+    final_date = get_column(Orders, "final_date")
+    payment_done = get_column(Orders, "payment_done")
+    customer_id = get_column(Orders, "customer_id")
+
+    columns = [
+        order_id.label("order_id"),
+        branch_id.label("branch_id"),
+    ]
+
+    if status_col is not None:
+        columns.append(status_col.label("status"))
+    if price_col is not None:
+        columns.append(price_col.label("price"))
+    if cost_col is not None:
+        columns.append(cost_col.label("cost"))
+    if order_date is not None:
+        columns.append(order_date.label("order_date"))
+    if final_date is not None:
+        columns.append(final_date.label("final_date"))
+    if payment_done is not None:
+        columns.append(payment_done.label("payment_done"))
+
+    stmt = select(*columns).select_from(Orders)
+
+    if Customer is not None and customer_id is not None:
+        cust_id = get_column(Customer, "customer_id")
+        cust_name = get_column(Customer, "name")
+        cust_branch = get_column(Customer, "branch_id")
+        if cust_id is not None and cust_name is not None and cust_branch is not None:
+            stmt = stmt.outerjoin(
+                Customer,
+                (cust_id == customer_id) & (cust_branch == user["branch_id"]),
+            )
+            stmt = stmt.add_columns(cust_name.label("customer_name"))
+
+    stmt = stmt.where(branch_id == user["branch_id"]).order_by(order_id.desc())
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+# -----------------------------
+# Finance
+# -----------------------------
+
+@Finance_Router.get("/pricing")
+def get_finance_pricing(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    LocalItem = require_table_class("local_item")
+
+    local_item_id = require_column(LocalItem, "local_item_id")
+    branch_id = require_column(LocalItem, "branch_id")
+    name_col = get_column(LocalItem, "name")
+    category_col = get_column(LocalItem, "category_name", "catogary_name")
+    weight_col = get_column(LocalItem, "weight")
+    selling_price = get_column(LocalItem, "selling_price")
+    production_cost = get_column(LocalItem, "production_cost")
+
+    columns = [
+        local_item_id.label("local_item_id"),
+        branch_id.label("branch_id"),
+    ]
+
+    if name_col is not None:
+        columns.append(name_col.label("name"))
+    if category_col is not None:
+        columns.append(category_col.label("category_name"))
+    if weight_col is not None:
+        columns.append(weight_col.label("weight"))
+    if selling_price is not None:
+        columns.append(selling_price.label("selling_price"))
+    if production_cost is not None:
+        columns.append(production_cost.label("production_cost"))
+
+    stmt = select(*columns).where(branch_id == user["branch_id"]).order_by(local_item_id)
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Finance_Router.put("/pricing/{item_id}")
+def update_finance_pricing(
+    item_id: int,
+    payload: schema.PricingUpdate,
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    LocalItem = require_table_class("local_item")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided for update")
+
+    stmt = (
+        update(LocalItem)
+        .where(
+            LocalItem.local_item_id == item_id,
+            LocalItem.branch_id == user["branch_id"],
+        )
+        .values(**update_data)
+    )
+
+    try:
+        result = db.execute(stmt)
+        db.commit()
+
+        if result.rowcount == 0:  # type: ignore
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        cache_delete(admin_cache_key(user["branch_id"], "local_items"))
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
+        return {"message": "Pricing updated"}
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Finance_Router.get("/costs")
+def get_finance_costs(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    BranchCost = get_table_class("branch_import_cost")
+    if BranchCost is None:
+        return []
+
+    from_branch_id = get_column(BranchCost, "from_branch_id")
+    to_branch_id = get_column(BranchCost, "to_branch_id")
+    cost_col = get_column(BranchCost, "cost")
+
+    if to_branch_id is None:
+        raise HTTPException(status_code=500, detail="Missing cost columns")
+
+    columns = []
+    if from_branch_id is not None:
+        columns.append(from_branch_id.label("from_branch_id"))
+    columns.append(to_branch_id.label("to_branch_id"))
+    if cost_col is not None:
+        columns.append(cost_col.label("cost"))
+
+    stmt = select(*columns).where(to_branch_id == user["branch_id"])
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Finance_Router.get("/reports")
+def get_finance_reports(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    BranchTracker = require_table_class("branch_tracker")
+
+    branch_id = require_column(BranchTracker, "branch_id")
+    report_date = require_column(BranchTracker, "report_date")
+    sales = require_column(BranchTracker, "sales")
+    production_cost = require_column(BranchTracker, "production_cost")
+    operation_cost = require_column(BranchTracker, "operation_cost")
+
+    stmt = (
+        select(
+            report_date.label("report_date"),
+            sales.label("sales"),
+            production_cost.label("production_cost"),
+            operation_cost.label("operation_cost"),
+        )
+        .where(branch_id == user["branch_id"])
+        .order_by(report_date.desc())
+    )
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+# -----------------------------
+# Worker
+# -----------------------------
+
+@Worker_Router.get("/inventory")
+def get_worker_inventory(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    Inventory = require_table_class("inventory")
+    LocalItem = get_table_class("local_item")
+
+    inventory_id = require_column(Inventory, "inventory_id")
+    branch_id = require_column(Inventory, "branch_id")
+    local_item_id = require_column(Inventory, "local_item_id")
+    quantity = require_column(Inventory, "quantity")
+
+    columns = [
+        inventory_id.label("inventory_id"),
+        local_item_id.label("local_item_id"),
+        quantity.label("quantity"),
+    ]
+
+    stmt = select(*columns).select_from(Inventory)
+
+    if LocalItem is not None:
+        item_id = get_column(LocalItem, "local_item_id")
+        item_name = get_column(LocalItem, "name")
+        if item_id is not None and item_name is not None:
+            stmt = stmt.outerjoin(LocalItem, item_id == local_item_id)
+            stmt = stmt.add_columns(item_name.label("item_name"))
+
+    stmt = stmt.where(branch_id == user["branch_id"]).order_by(inventory_id)
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Worker_Router.put("/inventory/{inventory_id}")
+def update_worker_inventory(
+    inventory_id: int,
+    item: schema.InventoryUpdate,
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    Inventory = require_table_class("inventory")
+
+    update_data = item.model_dump(exclude_unset=True)
+    if "quantity" not in update_data:
+        raise HTTPException(status_code=400, detail="Only quantity updates are allowed")
+
+    stmt = (
+        update(Inventory)
+        .where(
+            Inventory.inventory_id == inventory_id,
+            Inventory.branch_id == user["branch_id"],
+        )
+        .values(quantity=update_data["quantity"])
+    )
+
+    try:
+        result = db.execute(stmt)
+        db.commit()
+
+        if result.rowcount == 0:  # type: ignore
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+
+        cache_delete(admin_cache_key(user["branch_id"], "inventory"))
+        return {"message": "Inventory updated"}
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Worker_Router.get("/movements")
+def get_worker_movements(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    OrderDetail = get_table_class("order_detail")
+    if OrderDetail is None:
+        return []
+
+    LocalItem = get_table_class("local_item")
+
+    order_id = get_column(OrderDetail, "order_id")
+    branch_id = get_column(OrderDetail, "branch_id")
+    local_item_id = get_column(OrderDetail, "local_item_id")
+    quantity = get_column(OrderDetail, "quantity")
+    detail_id = get_column(OrderDetail, "order_detail_id", "detail_id")
+
+    columns = []
+    if detail_id is not None:
+        columns.append(detail_id.label("movement_id"))
+    if order_id is not None:
+        columns.append(order_id.label("order_id"))
+    if local_item_id is not None:
+        columns.append(local_item_id.label("local_item_id"))
+    if quantity is not None:
+        columns.append(quantity.label("quantity"))
+
+    stmt = select(*columns).select_from(OrderDetail)
+
+    if LocalItem is not None and local_item_id is not None:
+        item_id = get_column(LocalItem, "local_item_id")
+        item_name = get_column(LocalItem, "name")
+        if item_id is not None and item_name is not None:
+            stmt = stmt.outerjoin(LocalItem, item_id == local_item_id)
+            stmt = stmt.add_columns(item_name.label("item_name"))
+
+    if branch_id is not None:
+        stmt = stmt.where(branch_id == user["branch_id"])
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
+        logging.error("DB error: %s", e)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@Worker_Router.get("/replenishments")
+def get_worker_replenishments(
+    db: Session = Depends(get_db_with_role),
+    user=Depends(get_current_user),
+):
+    Requisition = get_table_class("requisition_list")
+    if Requisition is None:
+        return []
+
+    LocalItem = get_table_class("local_item")
+
+    requisition_id = get_column(Requisition, "id")
+    branch_id = get_column(Requisition, "branch_id")
+    local_item_id = get_column(Requisition, "local_item_id")
+    quantity = get_column(Requisition, "sales_order_quantity")
+    approved = get_column(Requisition, "approved")
+
+    columns = []
+    if requisition_id is not None:
+        columns.append(requisition_id.label("requisition_id"))
+    if local_item_id is not None:
+        columns.append(local_item_id.label("local_item_id"))
+    if quantity is not None:
+        columns.append(quantity.label("quantity"))
+    if approved is not None:
+        columns.append(approved.label("approved"))
+
+    stmt = select(*columns).select_from(Requisition)
+
+    if LocalItem is not None and local_item_id is not None:
+        item_id = get_column(LocalItem, "local_item_id")
+        item_name = get_column(LocalItem, "name")
+        if item_id is not None and item_name is not None:
+            stmt = stmt.outerjoin(LocalItem, item_id == local_item_id)
+            stmt = stmt.add_columns(item_name.label("item_name"))
+
+    if branch_id is not None:
+        stmt = stmt.where(branch_id == user["branch_id"])
+
+    try:
+        rows = [dict(row) for row in db.execute(stmt).mappings().all()]
+        return rows
+    except SQLAlchemyError as e:
         logging.error("DB error: %s", e)
         raise HTTPException(status_code=500, detail="Database error")
 

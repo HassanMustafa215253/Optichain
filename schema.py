@@ -63,3 +63,8 @@ class RequisitionUpdate(BaseModel):
 class OrderUpdate(BaseModel):
     status: Optional[str] = None
     payment_done: Optional[float] = None
+
+
+class PricingUpdate(BaseModel):
+    selling_price: Optional[float] = None
+    production_cost: Optional[float] = None

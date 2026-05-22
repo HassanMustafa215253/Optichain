@@ -1,6 +1,14 @@
 import { LogOutIcon,Menu, User } from "lucide-react";
 
-export function Header({ activeSection,dropDown,open,setOpen,setActiveSection }) {
+export function Header({
+  activeSection,
+  dropDown,
+  open,
+  setOpen,
+  setActiveSection,
+  userName = "Admin User",
+  userEmail = "admin@portal.com",
+}) {
   const isHome = String(activeSection).toLowerCase() === "home";
 
   const handleMenuToggle = () => {
@@ -82,10 +90,10 @@ export function Header({ activeSection,dropDown,open,setOpen,setActiveSection })
           <div className="flex items-center gap-3 pl-4 border-l border-gray-200">
             <div className="text-right">
               <p className="text-sm font-medium text-gray-900">
-                Admin User
+                {userName}
               </p>
               <p className="text-xs text-gray-500">
-                admin@portal.com
+                {userEmail}
               </p>
             </div>
 
